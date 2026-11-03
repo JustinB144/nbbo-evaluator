@@ -1,0 +1,5 @@
+build/
+# DuckDB's header and library are large; third_party/duckdb/README.md says how to get them.
+third_party/duckdb/duckdb.h
+third_party/duckdb/duckdb.hpp
+third_party/duckdb/libduckdb.so

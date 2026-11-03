@@ -1,0 +1,8 @@
+-std=c++23
+-Ifoundation
+-isystem
+third_party/catch2
+-isystem
+third_party/duckdb
+-D__cpp_concepts=202002L
+-Wno-builtin-macro-redefined
