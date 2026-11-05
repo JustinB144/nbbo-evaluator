@@ -3,3 +3,4 @@ build/
 third_party/duckdb/duckdb.h
 third_party/duckdb/duckdb.hpp
 third_party/duckdb/libduckdb.so
+.venv/
