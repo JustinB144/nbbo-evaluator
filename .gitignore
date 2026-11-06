@@ -4,4 +4,4 @@ third_party/duckdb/duckdb.h
 third_party/duckdb/duckdb.hpp
 third_party/duckdb/libduckdb.so
 .venv/
-scripts/__pycache__/build_nbbo.cpython-312.pyc
+__pycache__/

@@ -1,0 +1,6 @@
+{
+  "typeCheckingMode": "standard",
+  "reportOptionalSubscript": "none",
+  "venvPath": ".",
+  "venv": ".venv"
+}
