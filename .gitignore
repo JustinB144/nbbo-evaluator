@@ -5,3 +5,4 @@ third_party/duckdb/duckdb.hpp
 third_party/duckdb/libduckdb.so
 .venv/
 __pycache__/
+docs/assignments/
