@@ -1,0 +1,52 @@
+# Copy this folder to questions/Q0001_<short_name>/ and fill in every field.
+# Commit the card before the first run (SPEC.md Part 1). After a run, any
+# change to condition, variants, pass_bar or kill is a new version.
+
+id = "Q0000"
+version = 1
+title = "Plumbing: hand-built and planted streams that check evaluate.py; not a real question"
+source = ""           # the paper or idea this comes from: authors, year, title, link
+written = ""          # YYYY-MM-DD
+status = "draft"      # draft, testing, validation, passed, killed
+
+# One sentence: what predicts what.
+hypothesis = ""
+
+# Who is on the other side, and why do they keep losing?
+why_it_would_exist = ""
+
+# TAQ products and columns used, and the earliest moment each value is known.
+data = ""
+
+# Which symbols, picked each day using only data known before the session.
+universe = ""
+
+# Forecast horizon: 1 to 60 seconds.
+horizon_seconds = 10
+
+# When a forecast is made: every N seconds, on each trade, or on a quote change.
+event = ""
+
+# The finest time step the inputs use: 100 ms or coarser.
+input_resolution_ms = 100
+
+# Delay between seeing the data and acting on it.
+latency_ms = 250
+
+# When the question is switched on: a formula over data known at the event, or "none".
+condition = "none"
+
+# Expected sign and rough size, in basis points.
+prediction = ""
+
+# The test-day result that sends it to validation, and the result that ends it.
+# Keep these top-level fields before [variants]; TOML would otherwise nest them.
+pass_bar = ""
+kill = ""
+
+# true: start on the 20 quick-subset days (SPEC.md Part 2) before all 119.
+quick_subset_first = true
+
+# The full parameter grid, written now. Every combination is a trial.
+[variants]
+# lookback_ms = [200, 1000, 5000]
