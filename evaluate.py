@@ -7,7 +7,6 @@
 #     -Stage 1 level: 10%
 
 
-
 import argparse
 import csv
 import json
@@ -15,6 +14,8 @@ import math
 import subprocess
 import sys
 import tomllib
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 import duckdb
@@ -33,6 +34,17 @@ SPLIT_FILE = "/mnt/data/artifacts/research_system/taq/2026-10-12-research-sample
 NBBO_DIR = "/mnt/data/artifacts/a1/nbbo"
 CLOSE_NS = 16 * 3600 * 1_000_000_000
 CI_LEVEL = 0.90    # confidence intervals match the 10% level: p < 0.10 exactly when the 90% CI excludes 0
+
+# The ledger's columns, in file order (SPEC Part 4). A change here is a spec
+# change: append_ledger refuses a ledger whose header doesn't match.
+LEDGER_COLUMNS = (
+    "run_id", "run_time", "code_commit",
+    "question_id", "version", "variant", "split", "latency_ms",
+    "n_rows", "n_active", "n_days", "n_symbols",
+    "no_quote", "after_close", "n_trades", "skipped_days",
+    "ic_mean", "ic_t", "ic_p", "ic_ci_low", "ic_ci_high", "ic_by_condition", "ic_at_0ms",
+    "taker_bps_per_trade", "hit_rate", "taker_t", "taker_p", "taker_ci_low", "taker_ci_high",
+    "max_corr_to_passed", "trials_all", "trials_question", "note")
 
 # Reads the command line and returns it.
 def flags():
@@ -150,11 +162,13 @@ def refusals(args, con):
         print(f"refused: {card_path} has never been committed")
         sys.exit(1)
 
-    # Unchanged: git status prints a line if the card differs from its last commit.
-    changes = subprocess.run(["git", "status", "--porcelain", "--", str(card_path)],
+    # Unchanged: git status prints one line per file that differs from its last
+    # commit. Checked for the card AND this program, so every ledger row's
+    # code_commit is exactly the code that ran.
+    changes = subprocess.run(["git", "status", "--porcelain", "--", str(card_path), "evaluate.py"],
         check=False, capture_output=True, text=True)
     if changes.returncode != 0 or changes.stdout.strip() != "":
-        print(f"refused: {card_path} has uncommitted changes")
+        print(f"refused: uncommitted changes (commit them, then run again):\n{changes.stdout}")
         sys.exit(1)
 
     print(f"accepted: {label['question_id']} v{label['version']} {label['variant']}, card {card_path}")
@@ -293,6 +307,16 @@ def trade_summary(con):
 
     return taker_bps_per_trade, hit_rate, n_trades, taker_day_mean, taker_t, taker_se, taker_days
 
+
+# How much evidence the stream submitted, counted before any row is dropped.
+def evidence_counts(con):
+    n_rows, n_active, n_days, n_symbols = con.execute("""
+        SELECT count(*), count_if(active), count(DISTINCT day), count(DISTINCT symbol)
+        FROM stream
+        """).fetchone()
+    return n_rows, n_active, n_days, n_symbols
+
+
 # Counts ledger rows so far. Both counts include this run (+ 1).
 def ledger_trials(ledger_path, qid):
     rows = []
@@ -366,13 +390,45 @@ def inference(mean, se, days):
     half = t_critical(CI_LEVEL, days - 1) * se
     return t_p(mean / se, days - 1), mean - half, mean + half
 
+# Step 3d. Appends one row to the ledger. Never rewrites existing rows. The
+# identity columns are filled here; `row` holds everything else.
+def append_ledger(ledger_path, row):
+    commit = subprocess.run(["git", "rev-parse", "HEAD"], check=False, capture_output=True, text=True)
+    if commit.returncode != 0:
+        print("failed: git rev-parse HEAD did not work; nothing written")
+        sys.exit(1)
+    row = {"run_id": uuid.uuid4().hex,
+           "run_time": datetime.now().astimezone().isoformat(timespec="seconds"),
+           "code_commit": commit.stdout.strip(),
+           **row}                                   # ** copies every key/value of row into this dict
+
+    path = Path(ledger_path)
+    path.parent.mkdir(parents=True, exist_ok=True)  # makes ledger/ if missing; no-op if it exists
+    new_file = not path.exists()
+    if not new_file:
+        # The header is the first line. If it isn't LEDGER_COLUMNS, appending
+        # would put values under the wrong column names.
+        with open(path, newline="") as f:
+            header = next(csv.reader(f), [])
+        if tuple(header) != LEDGER_COLUMNS:
+            print(f"refused: {path} header doesn't match LEDGER_COLUMNS; nothing written")
+            sys.exit(1)
+
+    with open(path, "a", newline="") as f:          # "a" = append: add to the end, never overwrite
+        writer = csv.DictWriter(f, fieldnames=LEDGER_COLUMNS)
+        if new_file:
+            writer.writeheader()
+        writer.writerow(row)                        # None becomes an empty cell
+    print(f"ledger: appended run {row['run_id']} to {path}")
+
 
 def main():
     args = flags()
     con = duckdb.connect()
     label, card_path = refusals(args, con)
     latency_ns = load_inputs(args, con, card_path)
-    
+    n_rows, n_active, n_days, n_symbols = evidence_counts(con)
+
     no_quote, after_close = compute_outcomes(con, latency_ns)
     _, ic_mean, ic_t, ic_days, skipped_days, ic_se = compute_ic(con, "'all'")[0]
     rows = compute_ic(con, "condition_state")
@@ -394,7 +450,23 @@ def main():
     ic_at_0ms = compute_ic(con, "'all'")[0][1]
     print(f"latency 0 ms: ic_mean {ic_at_0ms}")
 
-    # 3d: write the ledger row
+    # 3d: everything is computed, so the write is the last step. If anything
+    # above failed, the program stopped before this line and nothing was written.
+    append_ledger(args.ledger, {
+        "question_id": label["question_id"], "version": label["version"],
+        "variant": label["variant"], "split": args.split, "latency_ms": latency_ns // 1_000_000,
+        "n_rows": n_rows, "n_active": n_active, "n_days": n_days, "n_symbols": n_symbols,
+        "no_quote": no_quote, "after_close": after_close, "n_trades": n_trades,
+        "skipped_days": skipped_days,
+        "ic_mean": ic_mean, "ic_t": ic_t, "ic_p": ic_p,
+        "ic_ci_low": ic_ci_low, "ic_ci_high": ic_ci_high,
+        "ic_by_condition": ic_by_condition, "ic_at_0ms": ic_at_0ms,
+        "taker_bps_per_trade": taker_bps_per_trade, "hit_rate": hit_rate,
+        "taker_t": taker_t, "taker_p": taker_p,
+        "taker_ci_low": taker_ci_low, "taker_ci_high": taker_ci_high,
+        "max_corr_to_passed": None,                 # SPEC: left empty for now
+        "trials_all": n_all, "trials_question": n_this,
+        "note": ""})
 
 
 if __name__ == "__main__":
