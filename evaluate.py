@@ -1,10 +1,13 @@
-# DECISIONS:
+# DECISIONS (the short version for this file; the full list with dates and reasons is docs/DECISIONS.md):
 #     -Locked and crossed quotes were kept out of taker_pnl (the ask0 <= bid0 line in compute_outcomes)
 #     -Days with no usable IC (fewer than 2 active rows, or all scores equal) are skipped and counted
 #     -p-values are two-sided; the t keeps the sign. A negative score is a short, so IC > 0 means
 #      the calls are right, shorts included. Multiple testing is FDR, applied later from the ledger's
 #      raw p-values by a separate review step, not here (SPEC Part 5, S1-1 to S1-3)
 #     -Stage 1 level: 10%
+#     -IC is Spearman with average ranks (study S0003); p-values and 90% CIs use the Student t-distribution
+#     -Refuses if the card or this file has uncommitted changes; the ledger row is written last, every accepted run
+#     -Quotes are loaded one day at a time (memory: 2 GB instead of 15 GB on 20 days)
 
 
 import argparse
@@ -175,8 +178,8 @@ def refusals(args, con):
     return label, card_path
 
 
-# Runs once. Makes two tables in con, `stream` and `quotes`, and returns the
-# card's latency in nanoseconds.
+# Runs once. Makes the table `stream` in con and returns the card's latency in
+# nanoseconds and the sorted list of days the stream covers.
 def load_inputs(args, con, card_path):
     with open(card_path, "rb") as f:
         card = tomllib.load(f)
@@ -185,43 +188,51 @@ def load_inputs(args, con, card_path):
     con.execute("CREATE TABLE stream AS SELECT * FROM read_parquet(?)", [args.input_file])
 
     # fetchall() gives a list of tuples, one per row: [(day,), (day,), ...]
-    days = [r[0] for r in con.execute("SELECT DISTINCT day FROM stream").fetchall()]
-    paths = [f"{NBBO_DIR}/{day}.parquet" for day in days]
-    missing = [p for p in paths if not Path(p).exists()]
+    days = [r[0] for r in con.execute("SELECT DISTINCT day FROM stream ORDER BY day").fetchall()]
+    if not days:
+        print("refused: the stream has no rows")
+        sys.exit(1)
+    missing = [d for d in days if not Path(f"{NBBO_DIR}/{d}.parquet").exists()]
     if missing:
         print(f"failed: no NBBO file for {missing}; run scripts/build_nbbo.py")
         sys.exit(1)
 
-    # r"""...""" (raw string) so the \d in the pattern reaches DuckDB unchanged.
-    con.execute(r"""
-        CREATE TABLE quotes AS
-        SELECT CAST(regexp_extract(filename, '(\d{4}-\d{2}-\d{2})\.parquet', 1) AS DATE) AS day,
-            symbol, nanos, bid, ask
-        FROM read_parquet(?, filename = true)
-        """, [paths])
-    return latency_ns
+    # Quotes are NOT loaded here. All days at once costs memory in proportion
+    # to the number of days (14 GB for 20 days, measured in A2); compute_outcomes
+    # reads one day at a time instead.
+    return latency_ns, days
 
 
 # Step 3b. Called twice: with the card's latency, then with 0.
 # Makes (or replaces) the table `outcomes` and returns the drop counts.
-def compute_outcomes(con, latency_ns):
-    con.execute("""
-        CREATE OR REPLACE TABLE outcomes AS
+# Works one day at a time: load that day's quotes, join that day's stream rows
+# to them, add the result to `outcomes`. Memory then depends on the busiest
+# single day (about 1.4 GB peak), not on how many days the stream covers.
+# Each NBBO file holds one day, so the join only needs to match the symbol.
+def compute_outcomes(con, latency_ns, days):
+    for i, day in enumerate(days):
+        con.execute("CREATE OR REPLACE TEMP TABLE day_quotes AS SELECT symbol, nanos, bid, ask FROM read_parquet(?)",
+            [f"{NBBO_DIR}/{day}.parquet"])
+        # The first day creates `outcomes` (replacing the previous call's);
+        # every later day adds its rows to it.
+        start = "CREATE OR REPLACE TABLE outcomes AS" if i == 0 else "INSERT INTO outcomes"
+        con.execute(start + """
         WITH s AS (
             SELECT *,
                 event_time + ? AS t0,
                 event_time + ? + horizon_ns AS t1
             FROM stream
+            WHERE day = ?
         ),
         j AS (
             SELECT s.*,
                 q0.bid AS bid0, q0.ask AS ask0,
                 q1.bid AS bid1, q1.ask AS ask1
             FROM s
-            ASOF LEFT JOIN quotes q0
-                ON s.day = q0.day AND s.symbol = q0.symbol AND s.t0 >= q0.nanos
-            ASOF LEFT JOIN quotes q1
-                ON s.day = q1.day AND s.symbol = q1.symbol AND s.t1 >= q1.nanos
+            ASOF LEFT JOIN day_quotes q0
+                ON s.symbol = q0.symbol AND s.t0 >= q0.nanos
+            ASOF LEFT JOIN day_quotes q1
+                ON s.symbol = q1.symbol AND s.t1 >= q1.nanos
         )
         SELECT *,
             (bid0 + ask0) / 2 AS mid0,
@@ -235,8 +246,9 @@ def compute_outcomes(con, latency_ns):
             END AS taker_pnl
         FROM j
         """,
-        [latency_ns, latency_ns])
-    
+            [latency_ns, latency_ns, day])
+    con.execute("DROP TABLE day_quotes")
+
     after_close, no_quote = con.execute("SELECT count_if(t1 > ? AND bid0 IS NOT NULL), count_if(bid0 IS NULL) FROM outcomes",[CLOSE_NS]).fetchone()
     con.execute("DELETE FROM outcomes WHERE t1 > ? OR bid0 IS NULL",[CLOSE_NS])
 
@@ -426,10 +438,10 @@ def main():
     args = flags()
     con = duckdb.connect()
     label, card_path = refusals(args, con)
-    latency_ns = load_inputs(args, con, card_path)
+    latency_ns, days = load_inputs(args, con, card_path)
     n_rows, n_active, n_days, n_symbols = evidence_counts(con)
 
-    no_quote, after_close = compute_outcomes(con, latency_ns)
+    no_quote, after_close = compute_outcomes(con, latency_ns, days)
     _, ic_mean, ic_t, ic_days, skipped_days, ic_se = compute_ic(con, "'all'")[0]
     rows = compute_ic(con, "condition_state")
     ic_by_condition = json.dumps({row[0]: row[1] for row in rows})
@@ -446,7 +458,7 @@ def main():
     print(f"  taker_p {taker_p}, {CI_LEVEL:.0%} CI of the daily mean [{taker_ci_low}, {taker_ci_high}]")
     print(f"  trials {n_all} all-time, {n_this} this question")
 
-    compute_outcomes(con, 0)    # the drop counts at 0 ms are not needed
+    compute_outcomes(con, 0, days)    # the drop counts at 0 ms are not needed
     ic_at_0ms = compute_ic(con, "'all'")[0][1]
     print(f"latency 0 ms: ic_mean {ic_at_0ms}")
 

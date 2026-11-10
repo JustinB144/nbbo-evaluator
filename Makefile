@@ -26,6 +26,10 @@ clean:
 build:
 	mkdir -p build
 
+# Q0000 planted streams (plumbing, not a real question): ./build/q0000_planted
+build/q0000_planted: questions/Q0000_plumbing/planted.cpp Makefile | build
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< $(DUCKDB) -o $@
+
 # The TAQ reader: ./build/read_nbbo YYYY-MM-DD
 build/read_nbbo: readers/read_nbbo.cpp $(FOUNDATION) $(HEADERS) Makefile | build
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) readers/read_nbbo.cpp $(FOUNDATION) $(DUCKDB) -o $@
