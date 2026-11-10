@@ -1,7 +1,21 @@
 #include <duckdb.hpp>
 #include <iostream>
 #include <string>
+#include <format>
+#include <filesystem>
+#include <fstream>
+namespace fs = std::filesystem;
+
+struct Variant {
+	std::string name;
+	std::string score;
+};
 int main(){
+	const Variant variants [] = {
+		{"perfect", "true_move"},
+		{"flipped", "-true_move"},
+		{"shuffled", "shuffled"},
+	};
     duckdb::DuckDB database(nullptr);
     duckdb::Connection connection(database);
     //step 1
@@ -44,4 +58,31 @@ int main(){
         }
     }
     std::cout << connection.Query("SELECT day, count(*) FROM planted GROUP BY day ORDER BY day")->ToString();
+
+    auto shuffled_column = connection.Query(R"sql(
+    CREATE TABLE streams AS
+    WITH a AS (SELECT *, row_number() OVER (PARTITION BY day ORDER BY symbol, event_time) AS k FROM planted),
+    	b AS (SELECT day, true_move AS shuffled, row_number() OVER (PARTITION BY day ORDER BY hash(symbol, event_time)) AS k FROM planted)
+     SELECT a.*, b.shuffled FROM a JOIN b USING (day, k)
+    )sql");
+
+    const std::string out_dir = "/mnt/data/artifacts/questions/streams/Q0000/v1";
+    fs::create_directories(out_dir);
+    
+    for (const Variant& v : variants){
+        std::string path = out_dir + "/" + v.name + ".parquet";
+        std::string sql = std::format(R"sql(
+            COPY (SELECT day, symbol, event_time, event_time AS available_time,
+                         10000000000::BIGINT AS horizon_ns, CAST({} AS DOUBLE) AS score,
+                         true AS active, 'none' AS condition_state
+                  FROM streams ORDER BY day, symbol, event_time)
+            TO '{}' (FORMAT parquet))sql", v.score, path);
+        auto copy = connection.Query(sql);
+        if (copy->HasError()){
+            std::cerr << "ERROR writing " << path << ": " << copy->GetError() << std::endl;
+            return 1;
+        }
+        std::ofstream sidecar(out_dir + "/" + v.name + ".json");
+        sidecar << R"({"question_id": "Q0000", "version": 1, "variant": ")" << v.name << "\"}\n";
+    }
 }
