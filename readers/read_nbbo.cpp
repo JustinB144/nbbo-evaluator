@@ -47,9 +47,9 @@ std::expected<int, std::string> get_quote(const fs::path &folder, std::string &d
 				CAST(best_asksizeshares AS BIGINT) AS best_ask_size
 			FROM read_parquet(')sql"
 			+ folder.string()
-			+ R"sql(/*.parquet')
+			+ R"sql(/*.parquet', filename = true, file_row_number = true)
 			WHERE time_m >= TIME '09:30:00' AND time_m < TIME '16:00:00'
-			ORDER BY ticker, trading_class, time_micro, time_nano;
+			ORDER BY ticker, trading_class, time_micro, time_nano, filename, file_row_number;
 		)sql";
 	}
 	else {
@@ -65,9 +65,9 @@ std::expected<int, std::string> get_quote(const fs::path &folder, std::string &d
 				CAST(best_asksizeshares AS BIGINT) AS best_ask_size
 			FROM read_parquet(')sql"
 			+ folder.string()
-			+ R"sql(/*.parquet')
+			+ R"sql(/*.parquet', filename = true, file_row_number = true)
 			WHERE time_m >= TIME '09:30:00' AND time_m < TIME '16:00:00'
-			ORDER BY ticker, trading_class, time_micro, time_nano;
+			ORDER BY ticker, trading_class, time_micro, time_nano, filename, file_row_number;
 		)sql";
 	}
 	/*
@@ -205,7 +205,7 @@ std::expected<int, std::string> get_quote(const fs::path &folder, std::string &d
 	appender.Close();
 	std::filesystem::create_directories("/mnt/data/artifacts/a1/nbbo/"); //only creates directory if it doesn't already exist
 	auto copy = connection.Query("COPY nbbo_rows TO '/mnt/data/artifacts/a1/nbbo/" + day + ".parquet' (FORMAT parquet)");
-	if (copy->HasError()) return std::unexpected(copy->GetError());
+	if (copy -> HasError()) return std::unexpected(copy -> GetError());
 	return row_count;
 }
 

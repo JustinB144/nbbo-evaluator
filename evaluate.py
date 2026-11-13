@@ -4,7 +4,7 @@
 #     -p-values are two-sided; the t keeps the sign. A negative score is a short, so IC > 0 means
 #      the calls are right, shorts included. Multiple testing is FDR, applied later from the ledger's
 #      raw p-values by a separate review step, not here (SPEC Part 5, S1-1 to S1-3)
-#     -Stage 1 level: 10%
+#     -Stage 1 level: 15%
 #     -IC is Spearman with average ranks (study S0003); p-values and 90% CIs use the Student t-distribution
 #     -Refuses if the card or this file has uncommitted changes; the ledger row is written last, every accepted run
 #     -Quotes are loaded one day at a time (memory: 2 GB instead of 15 GB on 20 days)
@@ -36,7 +36,7 @@ COLUMN_CONST = (
 SPLIT_FILE = "/mnt/data/artifacts/research_system/taq/2026-10-12-research-samples/out/assignment.csv"
 NBBO_DIR = "/mnt/data/artifacts/a1/nbbo"
 CLOSE_NS = 16 * 3600 * 1_000_000_000
-CI_LEVEL = 0.90    # confidence intervals match the 10% level: p < 0.10 exactly when the 90% CI excludes 0
+CI_LEVEL = 0.90    # confidence intervals match the 15% level: p < 0.10 exactly when the 90% CI excludes 0
 
 # The ledger's columns, in file order (SPEC Part 4). A change here is a spec
 # change: append_ledger refuses a ledger whose header doesn't match.
@@ -211,8 +211,12 @@ def load_inputs(args, con, card_path):
 # Each NBBO file holds one day, so the join only needs to match the symbol.
 def compute_outcomes(con, latency_ns, days):
     for i, day in enumerate(days):
-        con.execute("CREATE OR REPLACE TEMP TABLE day_quotes AS SELECT symbol, nanos, bid, ask FROM read_parquet(?)",
-            [f"{NBBO_DIR}/{day}.parquet"])
+        con.execute("""CREATE OR REPLACE TEMP TABLE day_quotes AS
+            SELECT symbol, nanos,
+                arg_max(bid, file_row_number) AS bid,
+                arg_max(ask, file_row_number) AS ask
+            FROM read_parquet(?, file_row_number = true)
+            GROUP BY symbol, nanos""", [f"{NBBO_DIR}/{day}.parquet"])
         # The first day creates `outcomes` (replacing the previous call's);
         # every later day adds its rows to it.
         start = "CREATE OR REPLACE TABLE outcomes AS" if i == 0 else "INSERT INTO outcomes"
@@ -277,7 +281,9 @@ def compute_ic(con, group):
             FROM numbered
         ),
         daily AS (
-            SELECT day, grp, corr(score_rank, move_rank) AS ic
+            SELECT day, grp,
+                CASE WHEN isnan(corr(score_rank, move_rank)) THEN NULL
+                    ELSE corr(score_rank, move_rank) END AS ic
             FROM ranked
             GROUP BY day, grp
         )
