@@ -13,7 +13,9 @@
 import argparse
 import csv
 import json
+import hashlib
 import math
+import re
 import subprocess
 import sys
 import tomllib
@@ -140,6 +142,16 @@ def refusals(args, con):
         print(f"refused: {missing_split_days} rows not allowed in the split")
         sys.exit(1)
 
+    infinite_score = con.execute("""
+        SELECT count(*) 
+        from read_parquet(?)
+        WHERE NOT isfinite(score)
+        """,
+        [args.input_file],).fetchone()[0]
+    if infinite_score > 0:
+        print(f"refused: {infinite_score} rows have a NaN or infinite score")
+        sys.exit(1)
+    
     # The card: stream -> <variant>.json next to it -> question_id -> questions/<id>_*/card.toml
     json_path = Path(args.input_file).with_suffix(".json")
     if not json_path.exists():
@@ -151,13 +163,39 @@ def refusals(args, con):
         if key not in label:
             print(f"refused: {json_path} has no {key}")
             sys.exit(1)
-
-    cards = list(Path("questions").glob(f"{label['question_id']}_*/card.toml"))
+    if not re.fullmatch(r"Q\d{4}", str(label["question_id"])):
+        print(f"refused: question_id{label['question_id']!r} is not Q followed by 4 digits")
+        sys.exit(1)
+    prefix = label["question_id"] + "_"
+    
+    cards = [d / "card.toml" for d in Path("questions").iterdir()
+                if d.is_dir() and d.name.startswith(prefix)]
     if len(cards) != 1:
         print(f"refused: expected 1 card for {label['question_id']}, found {len(cards)}")
         sys.exit(1)
     card_path = cards[0]
+    card_hash = hashlib.sha256(card_path.read_bytes()).hexdigest()
+    
+    with open(card_path, "rb") as f:
+        card = tomllib.load(f)
+    if card["id"] != label["question_id"] or card["version"] != label["version"]:
+        print(f"refused: the label says {label['question_id']} v{label['version']}, "
+                    f"the card says {card['id']} v{card['version']}")
+        sys.exit(1)
 
+    if args.ledger != "ledger/ledger.csv" and label["question_id"] != "Q0000":
+        print(f"refused: only Q0000 may use a scratch ledger; {label['question_id']} writes to ledger/ledger.csv")
+        sys.exit(1)
+
+    if Path(args.ledger).exists():
+        with open(args.ledger, newline="") as f:
+            for row in csv.DictReader(f):
+                if (card["id"] == row["question_id"] and str(card["version"]) == row["version"]
+                    and row.get("card_hash") and row["card_hash"] != card_hash):
+                        print(f"refused: {card['id']} v{card['version']} changed after a run "
+                            f"(ledger {row['card_hash'][:12]}, now {card_hash[:12]}); make it a new version")
+                        sys.exit(1)
+                        
     # Committed: git log prints the last commit that touched the card, or nothing if none did.
     last_commit = subprocess.run(["git", "log", "-1", "--format=%H", "--", str(card_path)],
         check=False, capture_output=True, text=True)
@@ -175,14 +213,13 @@ def refusals(args, con):
         sys.exit(1)
 
     print(f"accepted: {label['question_id']} v{label['version']} {label['variant']}, card {card_path}")
-    return label, card_path
+    return label, card, card_hash
 
 
 # Runs once. Makes the table `stream` in con and returns the card's latency in
 # nanoseconds and the sorted list of days the stream covers.
-def load_inputs(args, con, card_path):
-    with open(card_path, "rb") as f:
-        card = tomllib.load(f)
+def load_inputs(args, con, card):
+   
     latency_ns = card["latency_ms"] * 1_000_000
 
     con.execute("CREATE TABLE stream AS SELECT * FROM read_parquet(?)", [args.input_file])
@@ -253,8 +290,17 @@ def compute_outcomes(con, latency_ns, days):
             [latency_ns, latency_ns, day])
     con.execute("DROP TABLE day_quotes")
 
-    after_close, no_quote = con.execute("SELECT count_if(t1 > ? AND bid0 IS NOT NULL), count_if(bid0 IS NULL) FROM outcomes",[CLOSE_NS]).fetchone()
-    con.execute("DELETE FROM outcomes WHERE t1 > ? OR bid0 IS NULL",[CLOSE_NS])
+    
+    after_close, no_quote = con.execute("""
+        SELECT
+            count_if(bid0 IS NOT NULL AND ask0 IS NOT NULL AND t1 > ?),
+            count_if(bid0 IS NULL OR ask0 IS NULL
+                     OR (t1 <= ? AND (bid1 IS NULL OR ask1 IS NULL)))
+        FROM outcomes""", [CLOSE_NS, CLOSE_NS]).fetchone()
+    con.execute("""
+        DELETE FROM outcomes
+        WHERE t1 > ? OR bid0 IS NULL OR ask0 IS NULL OR bid1 IS NULL OR ask1 IS NULL""",
+        [CLOSE_NS])
 
     return no_quote, after_close
 
@@ -443,8 +489,8 @@ def append_ledger(ledger_path, row):
 def main():
     args = flags()
     con = duckdb.connect()
-    label, card_path = refusals(args, con)
-    latency_ns, days = load_inputs(args, con, card_path)
+    label, card, card_hash = refusals(args, con)
+    latency_ns, days = load_inputs(args, con, card)
     n_rows, n_active, n_days, n_symbols = evidence_counts(con)
 
     no_quote, after_close = compute_outcomes(con, latency_ns, days)
