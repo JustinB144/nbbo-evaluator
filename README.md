@@ -17,10 +17,11 @@ The evaluator is the core idea. It refuses bad input instead of scoring it, it c
 
 ## How the evaluator works
 
-1. **Refusals first.** A stream is rejected, not scored, if it has look-ahead rows (data marked available after the event it's used for), NULLs, duplicate (day, symbol, time) keys, horizons outside 1–60 s, days outside the allowed test split, or if its question card isn't committed.
-2. **Outcomes with latency.** For each forecast, DuckDB `ASOF` joins find the quote in force after the card's latency and the quote at the horizon. The outcome is the mid-price move between them, and a taker P&L that pays the spread.
-3. **Information coefficient (IC).** Per day, a Spearman rank correlation between score and move, computed with SQL window functions and average ranks, so ties are handled correctly. Across days: mean IC, t-statistic, p-value and 90% confidence interval from the Student t distribution.
-4. **Ledger.** Every accepted run appends one row, written last, so a crash never leaves a half-recorded result.
+1. **Refusals first.** A stream is rejected, not scored, if it has look-ahead rows (data marked available after the event it's used for), NULLs, NaN or infinite scores, duplicate (day, symbol, time) keys, horizons outside 1–60 s, or days outside the allowed test split. Its question card must be committed, and its label must match the card's ID and version exactly.
+2. **No silent re-runs.** Every run records a SHA-256 hash of its card. If a card is edited after it has been run, the evaluator refuses to run it again under the same version, so a test can't be quietly re-tuned until it passes. Only the plumbing test (Q0000) may write to a scratch ledger.
+3. **Outcomes with latency.** For each forecast, DuckDB `ASOF` joins find the quote in force after the card's latency and the quote at the horizon. Quotes missing either the bid or the ask are never used. The outcome is the mid-price move between them, and a taker P&L that pays the spread.
+4. **Information coefficient (IC).** Per day, a Spearman rank correlation between score and move, computed with SQL window functions and average ranks, so ties are handled correctly. Across days: mean IC, t-statistic, p-value and 90% confidence interval from the Student t distribution, computed in plain Python (no SciPy).
+5. **Ledger.** Every accepted run appends one row, written last, so a crash never leaves a half-recorded result. Each row records the card hash, the stream hash, the quote-file build, and the DuckDB version, so any result can be traced back to exactly what produced it. A run where no rows survive still gets a row, so failed attempts are counted too.
 
 ## Planted-signal check (Q0000)
 
