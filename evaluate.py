@@ -43,7 +43,8 @@ CI_LEVEL = 0.90    # confidence intervals match the 15% level: p < 0.10 exactly 
 # The ledger's columns, in file order (SPEC Part 4). A change here is a spec
 # change: append_ledger refuses a ledger whose header doesn't match.
 LEDGER_COLUMNS = (
-    "run_id", "run_time", "code_commit",
+    "run_id", "run_time", "code_commit", 
+    "card_hash", "stream_hash", "nbbo_build", "duckdb_version",
     "question_id", "version", "variant", "split", "latency_ms",
     "n_rows", "n_active", "n_days", "n_symbols",
     "no_quote", "after_close", "n_trades", "skipped_days",
@@ -212,8 +213,17 @@ def refusals(args, con):
         print(f"refused: uncommitted changes (commit them, then run again):\n{changes.stdout}")
         sys.exit(1)
 
+    with open(args.input_file, "rb") as f:
+        stream_hash = hashlib.file_digest(f, "sha256").hexdigest()
+    build_path = Path(NBBO_DIR) / "build.json"          
+    if not build_path.exists():
+        print(f"refused: no {build_path}; the quote files have no build record")
+        sys.exit(1)
+    with open(build_path) as f:
+        nbbo_build = json.load(f)["code_commit"]
+
     print(f"accepted: {label['question_id']} v{label['version']} {label['variant']}, card {card_path}")
-    return label, card, card_hash
+    return label, card, card_hash, stream_hash, nbbo_build
 
 
 # Runs once. Makes the table `stream` in con and returns the card's latency in
@@ -454,17 +464,9 @@ def inference(mean, se, days):
     return t_p(mean / se, days - 1), mean - half, mean + half
 
 # Step 3d. Appends one row to the ledger. Never rewrites existing rows. The
-# identity columns are filled here; `row` holds everything else.
-def append_ledger(ledger_path, row):
-    commit = subprocess.run(["git", "rev-parse", "HEAD"], check=False, capture_output=True, text=True)
-    if commit.returncode != 0:
-        print("failed: git rev-parse HEAD did not work; nothing written")
-        sys.exit(1)
-    row = {"run_id": uuid.uuid4().hex,
-           "run_time": datetime.now().astimezone().isoformat(timespec="seconds"),
-           "code_commit": commit.stdout.strip(),
-           **row}                                   # ** copies every key/value of row into this dict
-
+# identity from main and row are merged here; `row` holds everything else.
+def append_ledger(ledger_path, identity, row):                               
+    row = {**identity, **row}                         # ** copies every key/value of row into this dict
     path = Path(ledger_path)
     path.parent.mkdir(parents=True, exist_ok=True)  # makes ledger/ if missing; no-op if it exists
     new_file = not path.exists()
@@ -483,20 +485,30 @@ def append_ledger(ledger_path, row):
             writer.writeheader()
         writer.writerow(row)                        # None becomes an empty cell
     print(f"ledger: appended run {row['run_id']} to {path}")
-
-
+     
 def main():
     args = flags()
     con = duckdb.connect()
-    label, card, card_hash = refusals(args, con)
+    label, card, card_hash, stream_hash, nbbo_build = refusals(args, con)
+    commit = subprocess.run(["git", "rev-parse", "HEAD"], check=False, capture_output=True, text=True)
+    if commit.returncode != 0:
+        print("failed: git rev-parse HEAD did not work; nothing written")
+        sys.exit(1)
+    identity = {"run_id": uuid.uuid4().hex,
+                "run_time": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "code_commit": commit.stdout.strip(),
+                "card_hash": card_hash,
+                "stream_hash": stream_hash,
+                "nbbo_build": nbbo_build,
+                "duckdb_version": duckdb.__version__
+                }
     latency_ns, days = load_inputs(args, con, card)
     n_rows, n_active, n_days, n_symbols = evidence_counts(con)
-
     no_quote, after_close = compute_outcomes(con, latency_ns, days)
     n_usable = con.execute("SELECT count(*) FROM outcomes WHERE active").fetchone()[0]
     if n_usable == 0:
         n_all, n_this = ledger_trials(args.ledger, label["question_id"])
-        append_ledger(args.ledger, {
+        append_ledger(args.ledger, identity, {
             "question_id": label["question_id"], "version": label["version"],
             "variant": label["variant"], "split": args.split, "latency_ms": latency_ns // 1_000_000,
             "n_rows": n_rows, "n_active": n_active, "n_days": n_days, "n_symbols": n_symbols,
@@ -508,7 +520,6 @@ def main():
         return
 
     _, ic_mean, ic_t, ic_days, ic_se = compute_ic(con, "'all'")[0]
-    
     rows = compute_ic(con, "condition_state")
     skipped = len(days) - ic_days
     ic_by_condition = json.dumps({row[0]: row[1] for row in rows})
@@ -532,7 +543,7 @@ def main():
 
     # 3d: everything is computed, so the write is the last step. If anything
     # above failed, the program stopped before this line and nothing was written.
-    append_ledger(args.ledger, {
+    append_ledger(args.ledger, identity, {
         "question_id": label["question_id"], "version": label["version"],
         "variant": label["variant"], "split": args.split, "latency_ms": latency_ns // 1_000_000,
         "n_rows": n_rows, "n_active": n_active, "n_days": n_days, "n_symbols": n_symbols,
