@@ -337,7 +337,6 @@ def compute_ic(con, group):
             avg(ic)                                       AS ic_mean,
             avg(ic) / (stddev_samp(ic) / sqrt(count(ic))) AS ic_t,
             count(ic)                                     AS ic_days,
-            count_if(ic IS NULL)                          AS skipped_days,
             stddev_samp(ic) / sqrt(count(ic))             AS ic_se
         FROM daily
         GROUP BY grp
@@ -494,16 +493,33 @@ def main():
     n_rows, n_active, n_days, n_symbols = evidence_counts(con)
 
     no_quote, after_close = compute_outcomes(con, latency_ns, days)
-    _, ic_mean, ic_t, ic_days, skipped_days, ic_se = compute_ic(con, "'all'")[0]
+    n_usable = con.execute("SELECT count_if(active) FROM outcomes").fetchone()[0]
+    if n_usable == 0:
+        n_all, n_this = ledger_trials(args.ledger, label["question_id"])
+        append_ledger(args.ledger, {
+            "question_id": label["question_id"], "version": label["version"],
+            "variant": label["variant"], "split": args.split, "latency_ms": latency_ns // 1_000_000,
+            "n_rows": n_rows, "n_active": n_active, "n_days": n_days, "n_symbols": n_symbols,
+            "no_quote": no_quote, "after_close": after_close, "n_trades": 0,
+            "skipped_days": len(days),
+            "trials_all": n_all, "trials_question": n_this,
+            "note": "empty run: no active rows survived"})
+        print(f"empty run: no active rows survived ({no_quote} no quote, {after_close} after close)")
+        return
+
+    _, ic_mean, ic_t, ic_days, ic_se = compute_ic(con, "'all'")[0]
+    
     rows = compute_ic(con, "condition_state")
+    skipped = len(days) - ic_days
     ic_by_condition = json.dumps({row[0]: row[1] for row in rows})
-    (taker_bps_per_trade, hit_rate, n_trades,
+    (taker_bps_per_trade, hit_rate, n_trades, 
         taker_day_mean, taker_t, taker_se, taker_days) = trade_summary(con)
     n_all, n_this = ledger_trials(args.ledger, label["question_id"])
     ic_p, ic_ci_low, ic_ci_high = inference(ic_mean, ic_se, ic_days)
     taker_p, taker_ci_low, taker_ci_high = inference(taker_day_mean, taker_se, taker_days)
+    
     print(f"latency {latency_ns // 1_000_000} ms: ic_mean {ic_mean}, ic_t {ic_t}, "
-        f"{ic_days} days, {skipped_days} skipped; dropped {no_quote} no quote, {after_close} after close")
+        f"{ic_days} days, {skipped} skipped; dropped {no_quote} no quote, {after_close} after close")
     print(f"  ic_p {ic_p}, {CI_LEVEL:.0%} CI [{ic_ci_low}, {ic_ci_high}]")
     print(f"  by condition {ic_by_condition}")
     print(f"  taker {taker_bps_per_trade} bps/trade, hit rate {hit_rate}, taker_t {taker_t}, {n_trades} trades")
@@ -521,7 +537,7 @@ def main():
         "variant": label["variant"], "split": args.split, "latency_ms": latency_ns // 1_000_000,
         "n_rows": n_rows, "n_active": n_active, "n_days": n_days, "n_symbols": n_symbols,
         "no_quote": no_quote, "after_close": after_close, "n_trades": n_trades,
-        "skipped_days": skipped_days,
+        "skipped_days": skipped,
         "ic_mean": ic_mean, "ic_t": ic_t, "ic_p": ic_p,
         "ic_ci_low": ic_ci_low, "ic_ci_high": ic_ci_high,
         "ic_by_condition": ic_by_condition, "ic_at_0ms": ic_at_0ms,
