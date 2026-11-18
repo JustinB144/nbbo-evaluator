@@ -493,7 +493,7 @@ def main():
     n_rows, n_active, n_days, n_symbols = evidence_counts(con)
 
     no_quote, after_close = compute_outcomes(con, latency_ns, days)
-    n_usable = con.execute("SELECT count_if(active) FROM outcomes").fetchone()[0]
+    n_usable = con.execute("SELECT count(*) FROM outcomes WHERE active").fetchone()[0]
     if n_usable == 0:
         n_all, n_this = ledger_trials(args.ledger, label["question_id"])
         append_ledger(args.ledger, {
